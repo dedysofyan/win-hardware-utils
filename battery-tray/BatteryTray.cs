@@ -496,18 +496,19 @@ static class CorsairSdk {
     public const int CE_Success = 0;
     // CorsairDevicePropertyId
     public const int CDPI_BatteryLevel = 9;
-    // CorsairDataType
-    public const int CT_Bool = 1;
-    public const int CT_Int32 = 2;
-    public const int CT_Float64 = 3;
-    public const int CT_String = 4;
-    // CorsairSessionState
+    // CorsairDataType (from iCUESDK.h — base values start at 0)
+    public const int CT_Boolean = 0;
+    public const int CT_Int32 = 1;
+    public const int CT_Float64 = 2;
+    public const int CT_String = 3;
+    // CorsairSessionState (from iCUESDK.h — CONFIRMED ordering!)
+    public const int CSS_Invalid = 0;
     public const int CSS_Closed = 1;
     public const int CSS_Connecting = 2;
-    public const int CSS_Connected = 3;
-    public const int CSS_ConnectionLost = 4;
-    public const int CSS_ConnectionRefused = 5;
-    public const int CSS_ConnectionTimedOut = 6;
+    public const int CSS_Timeout = 3;
+    public const int CSS_ConnectionRefused = 4;
+    public const int CSS_ConnectionLost = 5;
+    public const int CSS_Connected = 6;
     // CorsairDeviceType mask (1<<n bits)
     public const uint CDT_Unknown = 0;
     public const uint CDT_Keyboard = 1;
@@ -590,7 +591,7 @@ static class CorsairSdk {
             // Reconnect if the previous session is in a bad terminal state.
             bool needReconnect = !_connectAttempted ||
                 _state == CSS_Closed || _state == CSS_ConnectionLost ||
-                _state == CSS_ConnectionRefused || _state == CSS_ConnectionTimedOut;
+                _state == CSS_ConnectionRefused || _state == CSS_Timeout;
             if (needReconnect) {
                 if (_connectAttempted) {
                     try { CorsairDisconnect(); } catch {}
