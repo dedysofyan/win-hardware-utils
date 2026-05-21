@@ -1,0 +1,19 @@
+# Build artifacts
+*.exe
+*.pdb
+*.dll
+*.lnk
+
+# Logs and state
+*.log
+*.state
+toggle-input-*.state
+
+# Per-project local working dirs
+battery-tray/flydigi-extract/
+backups/
+
+# OS junk
+Thumbs.db
+.DS_Store
+desktop.ini
