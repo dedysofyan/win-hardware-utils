@@ -217,7 +217,16 @@ class LogitechHidPp : IDisposable {
             req[1] = _devIdx;
             req[2] = _batteryFeatureIdx;
             req[3] = FuncSw(_batteryFeatureId == FEAT_BATTERY_STATUS ? (byte)0 : (byte)1);
-            var resp = Exchange(req);
+
+            // Retry once on timeout — G HUB constantly polls the same I2C bus and
+            // occasionally swallows our reply, which would otherwise flash the row
+            // as "offline" even though the mouse is on.
+            byte[] resp = null;
+            try { resp = Exchange(req, 900); }
+            catch (TimeoutException) {
+                Thread.Sleep(200);
+                resp = Exchange(req, 1200);
+            }
 
             // UnifiedBattery.GetStatus: resp[4]=stateOfCharge, resp[6]=status
             info.Percent = resp[4];
@@ -585,8 +594,11 @@ static class CorsairSdk {
 
     static System.Collections.Generic.List<int> _stateHistory = new System.Collections.Generic.List<int>();
 
+    public static int LastErrorCode;
+
     public static K70Result ReadK70() {
         var r = new K70Result();
+        LastErrorCode = 0;
         lock (_lock) {
             // Reconnect if the previous session is in a bad terminal state.
             bool needReconnect = !_connectAttempted ||
@@ -639,8 +651,9 @@ static class CorsairSdk {
                         CorsairFreeProperty(ref prop);
                         return r;
                     }
-                    CorsairFreeProperty(ref prop);
-                    r.Error = "ReadProperty err " + e2 + " type " + prop.type;
+                    try { CorsairFreeProperty(ref prop); } catch {}
+                    LastErrorCode = e2;
+                    r.Error = "ReadProperty err=" + e2 + " type=" + prop.type;
                     return r;
                 }
             }
@@ -776,6 +789,405 @@ static class CorsairCharging {
 }
 #endregion
 
+#region Desktop overlay window
+// A small always-visible semi-transparent window in a screen corner that mirrors
+// the tray data at a larger size. Click-through so it never intercepts mouse.
+class OverlayForm : Form {
+    const int WS_EX_TRANSPARENT = 0x20;
+    const int WS_EX_TOOLWINDOW  = 0x80;
+    const int WS_EX_LAYERED     = 0x80000;
+    const int WS_EX_NOACTIVATE  = 0x08000000;
+
+    public int LogiBars = -1, KbdBars = -1, ApexBars = -1;
+    public int? LogiPct, KbdPct;
+    public int? ApexGearVal; public int ApexMaxGear = 4;
+    public bool LogiCharging, KbdCharging;
+    public string LogiName = "Logitech G502 X PLUS";
+    public string KbdName  = "CORSAIR K70 RGB PRO Mini Wireless";
+    public string ApexName = "Flydigi Apex 4";
+
+    public bool Draggable = false;
+    public bool HideOffline = false;
+    public double OverlayOpacity = 0.92;
+
+    const int ROW_H = 30;
+    const int PAD_TOP = 10;
+    const int PAD_BOT = 8;
+    const int FIXED_W = 270;
+
+    static readonly string CfgFile = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "BatteryTray", "overlay-config.json");
+
+    public OverlayForm() {
+        FormBorderStyle = FormBorderStyle.None;
+        ShowInTaskbar   = false;
+        StartPosition   = FormStartPosition.Manual;
+        TopMost         = true;
+        DoubleBuffered  = true;
+        BackColor       = Color.FromArgb(15, 18, 24);
+        Size            = new Size(FIXED_W, PAD_TOP + 3 * ROW_H + PAD_BOT);
+        var cfg = LoadConfig();
+        OverlayOpacity = cfg.opacity;
+        HideOffline    = cfg.hideOffline;
+        Opacity        = OverlayOpacity;
+        Location       = (cfg.x >= 0 && cfg.y >= 0) ? new Point(cfg.x, cfg.y) : DefaultPosition();
+    }
+
+    class OverlayConfig { public int x = -1; public int y = -1; public double opacity = 0.92; public bool hideOffline = false; }
+
+    static Point DefaultPosition() {
+        var wa = Screen.PrimaryScreen.WorkingArea;
+        return new Point(wa.Right - FIXED_W - 16, wa.Top + 16);
+    }
+
+    static OverlayConfig LoadConfig() {
+        var r = new OverlayConfig();
+        try {
+            if (!File.Exists(CfgFile)) return r;
+            string t = File.ReadAllText(CfgFile);
+            var mx = System.Text.RegularExpressions.Regex.Match(t, "\"x\"\\s*:\\s*(-?\\d+)");
+            var my = System.Text.RegularExpressions.Regex.Match(t, "\"y\"\\s*:\\s*(-?\\d+)");
+            var mo = System.Text.RegularExpressions.Regex.Match(t, "\"opacity\"\\s*:\\s*([0-9.]+)");
+            var mh = System.Text.RegularExpressions.Regex.Match(t, "\"hideOffline\"\\s*:\\s*(true|false)");
+            if (mx.Success) int.TryParse(mx.Groups[1].Value, out r.x);
+            if (my.Success) int.TryParse(my.Groups[1].Value, out r.y);
+            if (mo.Success) double.TryParse(mo.Groups[1].Value, System.Globalization.NumberStyles.Float,
+                                            System.Globalization.CultureInfo.InvariantCulture, out r.opacity);
+            if (mh.Success) r.hideOffline = mh.Groups[1].Value == "true";
+        } catch {}
+        return r;
+    }
+    void SaveConfig() {
+        try {
+            var dir = Path.GetDirectoryName(CfgFile);
+            if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+            var json = string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                "{{\"x\":{0},\"y\":{1},\"opacity\":{2:0.00},\"hideOffline\":{3}}}",
+                Location.X, Location.Y, OverlayOpacity, HideOffline ? "true" : "false");
+            File.WriteAllText(CfgFile, json);
+        } catch {}
+    }
+
+    public void SetOpacity(double op) {
+        OverlayOpacity = Math.Max(0.2, Math.Min(1.0, op));
+        Opacity = OverlayOpacity;
+        SaveConfig();
+    }
+    public void SetHideOffline(bool h) {
+        HideOffline = h;
+        UpdateData();
+        SaveConfig();
+    }
+
+    protected override CreateParams CreateParams {
+        get {
+            var cp = base.CreateParams;
+            cp.ExStyle |= WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE;
+            if (!Draggable) cp.ExStyle |= WS_EX_TRANSPARENT;  // click-through only when locked
+            return cp;
+        }
+    }
+    protected override bool ShowWithoutActivation { get { return true; } }
+
+    public void SetDraggable(bool on) {
+        Draggable = on;
+        // Recreate window handle so the ExStyle change takes effect.
+        bool wasVisible = Visible;
+        if (wasVisible) Hide();
+        RecreateHandle();
+        if (wasVisible) Show();
+        // Repaint to show/hide drag-mode hint.
+        Invalidate();
+    }
+
+    Point _dragStart;
+    bool _dragging;
+    protected override void OnMouseDown(MouseEventArgs e) {
+        if (Draggable && e.Button == MouseButtons.Left) {
+            _dragStart = e.Location;
+            _dragging = true;
+        }
+    }
+    protected override void OnMouseMove(MouseEventArgs e) {
+        if (_dragging) {
+            Location = new Point(Location.X + e.X - _dragStart.X, Location.Y + e.Y - _dragStart.Y);
+        }
+    }
+    protected override void OnMouseUp(MouseEventArgs e) {
+        if (_dragging) { _dragging = false; SaveConfig(); }
+    }
+
+    public void UpdateData() {
+        // Compute visible row count and resize.
+        int n = 0;
+        if (!HideOffline || LogiBars >= 0) n++;
+        if (!HideOffline || KbdBars  >= 0) n++;
+        if (!HideOffline || ApexBars >= 0) n++;
+        if (n == 0) n = 1;  // keep a minimal "no devices" pill rather than vanishing
+        int newH = PAD_TOP + n * ROW_H + PAD_BOT;
+        if (Height != newH) Height = newH;
+        Invalidate();
+    }
+
+    protected override void OnPaint(PaintEventArgs e) {
+        var g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+
+        // Rounded background
+        using (var path = RoundedRect(0, 0, Width, Height, 10))
+        using (var bg = new SolidBrush(Color.FromArgb(220, 15, 18, 24)))
+        using (var border = new Pen(Draggable ? Color.FromArgb(180, 255, 200, 90) : Color.FromArgb(40, 255, 255, 255),
+                                    Draggable ? 2f : 1f)) {
+            g.FillPath(bg, path);
+            g.DrawPath(border, path);
+        }
+
+        // Build the list of rows to render based on hide-offline setting.
+        var rows = new System.Collections.Generic.List<Action<int>>();
+        if (!HideOffline || LogiBars >= 0)
+            rows.Add(y => DrawOverlayRow(g, OverlayKind.Mouse,    LogiName, LogiPct, null, LogiBars, 0, LogiCharging,  y));
+        if (!HideOffline || KbdBars >= 0)
+            rows.Add(y => DrawOverlayRow(g, OverlayKind.Keyboard, KbdName,  KbdPct,  null, KbdBars,  0, KbdCharging,   y));
+        if (!HideOffline || ApexBars >= 0)
+            rows.Add(y => DrawOverlayRow(g, OverlayKind.Gamepad,  ApexName, null, ApexGearVal, ApexBars, ApexMaxGear, false, y));
+
+        if (rows.Count == 0) {
+            using (var f = new Font("Segoe UI", 11f, FontStyle.Italic, GraphicsUnit.Pixel))
+            using (var b = new SolidBrush(Color.FromArgb(140, 255, 255, 255))) {
+                var s = "no devices online";
+                var sz = g.MeasureString(s, f);
+                g.DrawString(s, f, b, (Width - sz.Width) / 2, (Height - sz.Height) / 2);
+            }
+            return;
+        }
+        for (int i = 0; i < rows.Count; i++) rows[i](PAD_TOP + i * ROW_H);
+    }
+
+    enum OverlayKind { Mouse, Keyboard, Gamepad }
+
+    static void DrawOverlayRow(Graphics g, OverlayKind kind, string name, int? pct, int? gearVal,
+                                int bars, int maxGear, bool charging, int y) {
+        // Glyph: Segoe Fluent Icons
+        string glyph = kind == OverlayKind.Mouse ? "" :
+                        kind == OverlayKind.Keyboard ? "" : "";
+        using (var iconFont = new Font("Segoe Fluent Icons", 12f, FontStyle.Regular, GraphicsUnit.Pixel))
+        using (var nameFont = new Font("Segoe UI", 11f, FontStyle.Regular, GraphicsUnit.Pixel))
+        using (var pctFont  = new Font("Segoe UI", 11f, FontStyle.Bold,    GraphicsUnit.Pixel))
+        using (var fg = new SolidBrush(Color.FromArgb(210, 255, 255, 255))) {
+            g.DrawString(glyph, iconFont, fg, 12, y - 1);
+            // Name (truncated to ~22 chars to fit)
+            string disp = name;
+            if (disp != null && disp.Length > 26) disp = disp.Substring(0, 25) + "…";
+            g.DrawString(disp, nameFont, fg, 34, y);
+        }
+
+        // Bars on the right
+        int barsX = 165;
+        if (bars < 0) {
+            using (var off = new SolidBrush(Color.FromArgb(110, 255, 255, 255)))
+            using (var f = new Font("Segoe UI", 10f, FontStyle.Italic, GraphicsUnit.Pixel))
+                g.DrawString("offline", f, off, barsX, y + 1);
+            return;
+        }
+        Color fill = bars >= 3 ? Color.FromArgb(96, 230, 96)
+                   : bars >= 2 ? Color.FromArgb(240, 200, 64)
+                   : bars >= 1 ? Color.FromArgb(240, 130, 64)
+                               : Color.FromArgb(240, 80, 80);
+        int cellW = 11, cellH = 10, gap = 2;
+        for (int i = 0; i < 4; i++) {
+            int cx = barsX + i * (cellW + gap);
+            using (var path = RoundedRect(cx, y + 3, cellW, cellH, 2))
+            using (var b = new SolidBrush(i < bars ? fill : Color.FromArgb(60, 255, 255, 255))) {
+                g.FillPath(b, path);
+            }
+        }
+        // Value text
+        string valText;
+        if (pct.HasValue) valText = pct.Value + "%";
+        else if (gearVal.HasValue) valText = gearVal.Value + "/" + maxGear;
+        else valText = "";
+        if (charging) valText += " ⚡";
+        using (var vf = new Font("Segoe UI", 10f, FontStyle.Regular, GraphicsUnit.Pixel))
+        using (var vb = new SolidBrush(Color.FromArgb(220, 255, 255, 255))) {
+            var sz = g.MeasureString(valText, vf);
+            g.DrawString(valText, vf, vb, 270 - sz.Width - 10, y);
+        }
+    }
+
+    static System.Drawing.Drawing2D.GraphicsPath RoundedRect(int x, int y, int w, int h, int r) {
+        var path = new System.Drawing.Drawing2D.GraphicsPath();
+        int d = r * 2;
+        path.AddArc(x, y, d, d, 180, 90);
+        path.AddArc(x + w - d, y, d, d, 270, 90);
+        path.AddArc(x + w - d, y + h - d, d, d, 0, 90);
+        path.AddArc(x, y + h - d, d, d, 90, 90);
+        path.CloseFigure();
+        return path;
+    }
+}
+#endregion
+
+#region Widget HTTP server (for Wallpaper Engine overlay)
+// Tiny TCP-level HTTP server on 127.0.0.1:47878. Two routes:
+//   GET /             -> widget HTML (embedded)
+//   GET /battery.json -> current device state as JSON (CORS: * to allow file:// callers)
+// Uses raw TcpListener so non-admin users don't need to set up an HTTP URL ACL.
+static class WidgetServer {
+    public const int PORT = 47878;
+    static volatile string _json = "{\"devices\":[]}";
+    static Thread _thread;
+    static bool _started;
+
+    public static void UpdateJson(string json) { _json = json ?? "{}"; }
+
+    public static void Start() {
+        if (_started) return;
+        _started = true;
+        _thread = new Thread(Run) { IsBackground = true, Name = "widget-http" };
+        _thread.Start();
+    }
+
+    static void Run() {
+        System.Net.Sockets.TcpListener listener = null;
+        try {
+            listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, PORT);
+            listener.Start();
+        } catch (Exception ex) {
+            try { File.AppendAllText(Path.Combine(Path.GetTempPath(), "battery-tray.log"),
+                DateTime.Now.ToString("HH:mm:ss.fff") + " widget server failed to bind: " + ex.Message + "\r\n"); } catch {}
+            return;
+        }
+        while (true) {
+            System.Net.Sockets.TcpClient client = null;
+            try {
+                client = listener.AcceptTcpClient();
+                ThreadPool.QueueUserWorkItem(_ => HandleClient(client));
+            } catch { try { if (client != null) client.Close(); } catch {} }
+        }
+    }
+
+    static void HandleClient(System.Net.Sockets.TcpClient client) {
+        try {
+            client.ReceiveTimeout = 2000;
+            client.SendTimeout = 2000;
+            using (var stream = client.GetStream()) {
+                var buf = new byte[4096];
+                int n = stream.Read(buf, 0, buf.Length);
+                if (n <= 0) return;
+                string req = System.Text.Encoding.ASCII.GetString(buf, 0, n);
+                string path = "/";
+                var lines = req.Split(new[] { "\r\n" }, StringSplitOptions.None);
+                if (lines.Length > 0) {
+                    var parts = lines[0].Split(' ');
+                    if (parts.Length >= 2) path = parts[1];
+                }
+                byte[] body;
+                string ctype;
+                if (path == "/battery.json" || path.StartsWith("/battery.json?")) {
+                    body = System.Text.Encoding.UTF8.GetBytes(_json);
+                    ctype = "application/json; charset=utf-8";
+                } else {
+                    body = System.Text.Encoding.UTF8.GetBytes(WidgetHtml.HTML);
+                    ctype = "text/html; charset=utf-8";
+                }
+                string headers =
+                    "HTTP/1.1 200 OK\r\n" +
+                    "Content-Type: " + ctype + "\r\n" +
+                    "Content-Length: " + body.Length + "\r\n" +
+                    "Access-Control-Allow-Origin: *\r\n" +
+                    "Cache-Control: no-store\r\n" +
+                    "Connection: close\r\n\r\n";
+                var headerBytes = System.Text.Encoding.ASCII.GetBytes(headers);
+                stream.Write(headerBytes, 0, headerBytes.Length);
+                stream.Write(body, 0, body.Length);
+            }
+        } catch {} finally { try { client.Close(); } catch {} }
+    }
+}
+
+static class WidgetHtml {
+    public const string HTML = @"<!doctype html>
+<html><head><meta charset='utf-8'><title>Battery Widget</title>
+<style>
+  html,body{margin:0;padding:0;background:transparent;color:#fff;
+    font:13px/1.3 'Segoe UI', system-ui, sans-serif;
+    -webkit-font-smoothing:antialiased;}
+  .widget{
+    display:inline-block;
+    padding:12px 14px;
+    background:rgba(15,18,24,0.55);
+    backdrop-filter:blur(14px);
+    -webkit-backdrop-filter:blur(14px);
+    border-radius:12px;
+    border:1px solid rgba(255,255,255,0.06);
+    box-shadow:0 6px 20px rgba(0,0,0,0.35);
+    min-width:230px;
+  }
+  .row{display:flex;align-items:center;gap:8px;padding:4px 0;}
+  .row + .row{border-top:1px solid rgba(255,255,255,0.05);}
+  .icon{
+    width:18px;height:18px;flex:0 0 18px;
+    display:flex;align-items:center;justify-content:center;
+    opacity:0.85;
+  }
+  .icon svg{width:16px;height:16px;fill:none;stroke:#fff;stroke-width:1.5;}
+  .name{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+    font-size:11.5px;color:rgba(255,255,255,0.85);}
+  .bars{display:flex;gap:2px;flex:0 0 60px;}
+  .cell{width:13px;height:8px;border-radius:2px;background:rgba(255,255,255,0.10);}
+  .cell.on{background:#5ad65a;}
+  .cell.on.warn{background:#e8c83a;}
+  .cell.on.low{background:#e84a4a;}
+  .pct{flex:0 0 36px;text-align:right;font-variant-numeric:tabular-nums;
+    font-size:11.5px;color:rgba(255,255,255,0.75);}
+  .off{color:rgba(255,255,255,0.35);font-style:italic;font-size:11px;}
+  .bolt{color:#fada55;margin-left:4px;}
+</style></head>
+<body><div class='widget' id='w'></div>
+<script>
+const ICONS = {
+  mouse:    `<svg viewBox='0 0 24 24'><rect x='7' y='3' width='10' height='18' rx='5'/><line x1='12' y1='3' x2='12' y2='10'/></svg>`,
+  keyboard: `<svg viewBox='0 0 24 24'><rect x='2' y='6' width='20' height='12' rx='2'/><line x1='6' y1='10' x2='6' y2='10'/><line x1='10' y1='10' x2='10' y2='10'/><line x1='14' y1='10' x2='14' y2='10'/><line x1='18' y1='10' x2='18' y2='10'/><line x1='8' y1='15' x2='16' y2='15'/></svg>`,
+  gamepad:  `<svg viewBox='0 0 24 24'><path d='M6 16 L4 11 a3 3 0 0 1 3-4 h10 a3 3 0 0 1 3 4 l-2 5 a2 2 0 0 1-3 0 l-1-2 h-4 l-1 2 a2 2 0 0 1-3 0 z'/><circle cx='8' cy='11' r='1'/><circle cx='16' cy='11' r='1'/></svg>`
+};
+const MAX_BARS = 4;
+function pctToBars(p){if(p<=0)return 0;if(p>=100)return 4;return Math.max(1,Math.ceil(p/25));}
+function classFor(b){return b>=3?'on':b>=2?'on warn':b>=1?'on low':'';}
+function renderRow(d){
+  const off = d.percent==null && (d.bars==null||d.bars<0);
+  let bars = '';
+  if(off){
+    bars = `<div class='off' style='flex:0 0 60px'>off</div>`;
+  } else {
+    const b = d.bars!=null? d.bars : pctToBars(d.percent);
+    const cls = classFor(b);
+    bars = `<div class='bars'>` + Array.from({length:MAX_BARS}, (_,i)=>
+      `<div class='cell ${i<b?cls:''}'></div>`).join('') + `</div>`;
+  }
+  const pct = off ? '' :
+    (d.percent!=null ? `${d.percent}%` : `${d.bars}/${d.maxBars||MAX_BARS}`);
+  const bolt = d.charging ? `<span class='bolt'>⚡</span>` : '';
+  return `<div class='row'>
+    <div class='icon'>${ICONS[d.kind]||''}</div>
+    <div class='name' title='${d.name}'>${d.name}</div>
+    ${bars}
+    <div class='pct'>${pct}${bolt}</div>
+  </div>`;
+}
+async function refresh(){
+  try{
+    const r = await fetch('/battery.json',{cache:'no-store'});
+    const j = await r.json();
+    document.getElementById('w').innerHTML = (j.devices||[]).map(renderRow).join('');
+  }catch(e){/* keep last render */}
+}
+refresh(); setInterval(refresh, 5000);
+</script></body></html>";
+}
+#endregion
+
 #region Tray app
 class TrayApp : ApplicationContext {
     readonly NotifyIcon _ni;
@@ -821,7 +1233,14 @@ class TrayApp : ApplicationContext {
         return Math.Max(0, Math.Min(BARS_MAX, (int)Math.Round((double)gear * BARS_MAX / maxGear)));
     }
 
+    OverlayForm _overlay;
+
     public TrayApp() {
+        WidgetServer.Start();
+
+        _overlay = new OverlayForm();
+        _overlay.Show();
+
         var menu = new ContextMenuStrip();
         // Use Segoe Fluent Icons (Win11) / Segoe MDL2 Assets (Win10) glyphs — same
         // icon font Windows itself uses. Code points: Mouse=E962, Keyboard=E92E,
@@ -834,12 +1253,38 @@ class TrayApp : ApplicationContext {
         var miCorsair = new ToolStripMenuItem("CORSAIR K70 RGB PRO Mini Wireless: …", iconKbd)   { Enabled = false };
         var miApex    = new ToolStripMenuItem("Flydigi Apex 4: …",                    iconPad)   { Enabled = false };
         var miRefresh = new ToolStripMenuItem("Refresh now");
+        var miOverlay = new ToolStripMenuItem("Desktop overlay") { CheckOnClick = true, Checked = true };
+        var miMove    = new ToolStripMenuItem("Move overlay (drag mode)") { CheckOnClick = true };
+        var miHide    = new ToolStripMenuItem("Hide offline rows") { CheckOnClick = true, Checked = _overlay.HideOffline };
+        var miOpacity = new ToolStripMenuItem("Opacity");
+        foreach (var p in new[] { 0.50, 0.60, 0.70, 0.80, 0.92, 1.00 }) {
+            double op = p;
+            var item = new ToolStripMenuItem(((int)(op * 100)) + "%") {
+                CheckOnClick = true,
+                Checked = Math.Abs(_overlay.OverlayOpacity - op) < 0.01
+            };
+            item.Click += (s, e) => {
+                _overlay.SetOpacity(op);
+                foreach (ToolStripMenuItem mi in miOpacity.DropDownItems) mi.Checked = (mi == item);
+            };
+            miOpacity.DropDownItems.Add(item);
+        }
         var miExit = new ToolStripMenuItem("Exit");
         miRefresh.Click += (s, e) => Refresh();
-        miExit.Click += (s, e) => { _ni.Visible = false; Application.Exit(); };
+        miOverlay.CheckedChanged += (s, e) => {
+            if (miOverlay.Checked) _overlay.Show(); else _overlay.Hide();
+        };
+        miMove.CheckedChanged += (s, e) => _overlay.SetDraggable(miMove.Checked);
+        miHide.CheckedChanged += (s, e) => _overlay.SetHideOffline(miHide.Checked);
+        miExit.Click += (s, e) => { _ni.Visible = false; _overlay.Close(); Application.Exit(); };
         menu.Items.Add(miLogi);
         menu.Items.Add(miCorsair);
         menu.Items.Add(miApex);
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(miOverlay);
+        menu.Items.Add(miMove);
+        menu.Items.Add(miHide);
+        menu.Items.Add(miOpacity);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(miRefresh);
         menu.Items.Add(miExit);
@@ -902,36 +1347,41 @@ class TrayApp : ApplicationContext {
         });
         var tCorsair = Task.Run(() => {
             try {
-                // 1) iCUE SDK — what iCUE itself sees (most accurate, supports charging state).
+                var pnp = PnpBattery.ReadAll("K70");
+                if (pnp.Count > 0) _corsairName = pnp[0].Name;
+
+                // iCUE SDK — fresh live value matching iCUE itself.
                 var sdk = CorsairSdk.ReadK70();
                 if (sdk.Percent.HasValue) {
                     _corsairPct = sdk.Percent;
-                    _corsairName = "CORSAIR K70 RGB PRO Mini Wireless";
-                    _corsairCharging = false;  // TODO: query CDPI_BatteryStatus when available
+                    _corsairCharging = false;
                     DbgLog("corsair SDK: pct=" + sdk.Percent);
                     return;
                 }
-                DbgLog("corsair SDK failed: " + (sdk.Error ?? "(none)") + " — trying BLE");
-                // 2) BLE GATT direct read (works even when iCUE is closed).
+                // SDK errors that mean "device is truly not connected right now".
+                // CE_InvalidOperation(5), CE_DeviceNotFound(6), CE_DeviceNotConnected(7).
+                // BLE / Pnp would return stale cached values; trust the SDK's "off" signal.
+                int err = CorsairSdk.LastErrorCode;
+                if (err == 5 || err == 6 || err == 7) {
+                    _corsairPct = null;
+                    _corsairCharging = false;
+                    DbgLog("corsair: SDK err=" + err + " (device off)");
+                    return;
+                }
+                // SDK couldn't connect to iCUE at all — fall back to BLE / Pnp.
+                DbgLog("corsair SDK unavailable: " + (sdk.Error ?? "?") + " — falling back");
                 var ble = BleBattery.ReadK70();
                 if (ble.Percent.HasValue) {
                     _corsairPct = ble.Percent;
-                    _corsairName = "CORSAIR K70 RGB PRO Mini Wireless";
-                    _corsairCharging = false;
                     DbgLog("corsair BLE: pct=" + ble.Percent);
                     return;
                 }
-                DbgLog("corsair BLE failed: " + ble.Error + " — falling back to Pnp");
-                // 3) Last resort: Windows-cached Pnp value (may be very stale).
-                var list = PnpBattery.ReadAll("K70");
-                if (list.Count > 0) {
-                    _corsairPct = list[0].Percent;
-                    _corsairName = list[0].Name;
-                } else {
-                    _corsairPct = null;
+                if (pnp.Count > 0) {
+                    _corsairPct = pnp[0].Percent;
+                    DbgLog("corsair Pnp: pct=" + pnp[0].Percent);
+                    return;
                 }
-                _corsairCharging = false;
-                DbgLog("corsair Pnp: pct=" + (_corsairPct.HasValue ? _corsairPct.Value.ToString() : "null"));
+                _corsairPct = null;
             } catch (Exception ex) { DbgLog("corsair EXC: " + ex.GetType().Name + " " + ex.Message); }
         });
         var tApex = Task.Run(() => {
@@ -953,6 +1403,17 @@ class TrayApp : ApplicationContext {
         int logiBars = _logiPct.HasValue    ? PctToBars(_logiPct.Value)         : -1;
         int kbdBars  = _corsairPct.HasValue ? PctToBars(_corsairPct.Value)      : -1;
         int apexBars = _apexGear.HasValue   ? GearToBars(_apexGear.Value, _apexMaxGear) : -1;
+        // Publish state for the Wallpaper Engine widget over the local HTTP endpoint.
+        WidgetServer.UpdateJson(BuildJson(logiBars, kbdBars, apexBars));
+
+        // Mirror state to the desktop overlay.
+        if (_overlay != null) {
+            _overlay.LogiBars = logiBars; _overlay.LogiPct = _logiPct; _overlay.LogiCharging = _logiCharging;
+            _overlay.KbdBars  = kbdBars;  _overlay.KbdPct  = _corsairPct; _overlay.KbdCharging = _corsairCharging;
+            if (!string.IsNullOrEmpty(_corsairName)) _overlay.KbdName = _corsairName;
+            _overlay.ApexBars = apexBars; _overlay.ApexGearVal = _apexGear; _overlay.ApexMaxGear = _apexMaxGear;
+            _overlay.UpdateData();
+        }
         DbgLog("update ui: logiBars=" + logiBars + " kbdBars=" + kbdBars + " apexBars=" + apexBars);
 
         // Set icon first — if tooltip text fails, at least the icon updates.
@@ -978,6 +1439,58 @@ class TrayApp : ApplicationContext {
         int bars = PctToBars(pct.Value);
         return prefix + ":" + bars + "/" + BARS_MAX + "(" + pct.Value + "%" + (charging ? "+" : "") + ")";
     }
+    static string Esc(string s) {
+        if (s == null) return "";
+        var sb = new System.Text.StringBuilder(s.Length + 8);
+        foreach (var c in s) {
+            switch (c) {
+                case '"': sb.Append("\\\""); break;
+                case '\\': sb.Append("\\\\"); break;
+                case '\n': sb.Append("\\n"); break;
+                case '\r': sb.Append("\\r"); break;
+                case '\t': sb.Append("\\t"); break;
+                default:
+                    if (c < 32) sb.Append("\\u").Append(((int)c).ToString("x4"));
+                    else sb.Append(c);
+                    break;
+            }
+        }
+        return sb.ToString();
+    }
+
+    string BuildJson(int logiBars, int kbdBars, int apexBars) {
+        var sb = new System.Text.StringBuilder(512);
+        sb.Append("{\"ts\":").Append(DateTimeOffset.UtcNow.ToUnixTimeSeconds())
+          .Append(",\"devices\":[");
+
+        // Mouse
+        sb.Append("{\"kind\":\"mouse\",\"name\":\"Logitech G502 X PLUS\",");
+        if (_logiPct.HasValue) sb.Append("\"percent\":").Append(_logiPct.Value);
+        else                   sb.Append("\"percent\":null");
+        sb.Append(",\"charging\":").Append(_logiCharging ? "true" : "false");
+        sb.Append(",\"status\":\"").Append(Esc(_logiStatus ?? "")).Append("\"}");
+
+        // Keyboard
+        string cName = string.IsNullOrEmpty(_corsairName) ? "CORSAIR K70 RGB PRO Mini Wireless" : _corsairName;
+        sb.Append(",{\"kind\":\"keyboard\",\"name\":\"").Append(Esc(cName)).Append("\",");
+        if (_corsairPct.HasValue) sb.Append("\"percent\":").Append(_corsairPct.Value);
+        else                      sb.Append("\"percent\":null");
+        sb.Append(",\"charging\":").Append(_corsairCharging ? "true" : "false").Append("}");
+
+        // Gamepad (Apex 4): bars/maxBars instead of percent
+        sb.Append(",{\"kind\":\"gamepad\",\"name\":\"Flydigi Apex 4\",");
+        if (_apexGear.HasValue) {
+            sb.Append("\"bars\":").Append(_apexGear.Value)
+              .Append(",\"maxBars\":").Append(_apexMaxGear);
+        } else {
+            sb.Append("\"bars\":null");
+        }
+        sb.Append(",\"stale\":").Append(_apexStale ? "true" : "false").Append("}");
+
+        sb.Append("]}");
+        return sb.ToString();
+    }
+
     static string ShortApex(string prefix, int? gear, int maxGear, bool stale) {
         if (!gear.HasValue) return prefix + ":-";
         int bars = GearToBars(gear.Value, maxGear);

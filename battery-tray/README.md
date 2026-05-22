@@ -1,22 +1,42 @@
 # battery-tray
 
-A single tray icon that shows battery levels for:
+A single tray icon **plus optional always-visible desktop overlay** that show
+battery levels for:
 
 - **Logitech G502 X PLUS** (Lightspeed wireless mouse) — via the HID++ 2.0
-  `UnifiedBattery` feature (`0x1004`).
-- **Corsair K70 RGB PRO Mini Wireless** — via the standard BLE GATT Battery
-  Service (`0x180F`), characteristic `0x2A19`. Falls back to Windows' cached
-  Pnp property if BLE fails.
+  `UnifiedBattery` feature (`0x1004`). One automatic retry on bus collision
+  (G HUB polls the same I2C channel and occasionally swallows our reply).
+- **Corsair K70 RGB PRO Mini Wireless** — primary path: **iCUE SDK v4**
+  (`iCUESDK.x64_2019.dll`) for the same live value iCUE itself shows. Falls
+  back to BLE GATT Battery Service (`0x180F` / `0x2A19`), then the
+  Windows-cached Pnp value. SDK error code 5/6/7 is treated as "device off"
+  so we don't surface stale BLE/Pnp values when iCUE reports the keyboard
+  unreachable.
 - **Flydigi Apex 4** — via the named pipe `\\?\pipe\fcs.sock` that
   `SpaceStationService.exe` exposes, speaking the FDG_PROTOCOL framing
   (`"FDG_PROTOCOL\n"` + 4-byte LE length + protobuf-encoded `IpcCommand`).
   The Apex query is `GetDeviceDetailInfo` (cmdId `4099`) and battery comes
   back at `IpcResult.field 7 → GetDeviceDetailInfoResult.field 1 →
-  ControllerInfo.field 1 → DeviceInfo.field 9`.
+  ControllerInfo.field 1 → DeviceInfo.field 9`. The service is single-client,
+  so the tray queries opportunistically (succeeds when Space Station UI is
+  closed; falls back to the last cached value otherwise).
 
-Each row in the tray icon shows a 4-bar level + small device glyph
-(mouse/keyboard/gamepad). Right-click for full readout with brand/model and
-optional charging state. The icon redraws every 10 s.
+## Surfaces
+
+- **Tray icon**: 16×16 with three vertically-stacked battery rows + a small
+  device glyph per row. Color: green ≥3/4, yellow ≥2/4, orange ≥1/4, red 0,
+  gray dash if offline. Lightning bolt overlay when charging. Right-click
+  for full readout, refresh, and overlay controls.
+- **Desktop overlay**: optional rounded HUD positioned anywhere on screen
+  (drag to reposition in "Move overlay" mode). Click-through when locked.
+  Configurable opacity (50–100%) and "hide offline rows" auto-shrink. State
+  persisted in `%LOCALAPPDATA%\BatteryTray\overlay-config.json`.
+- **Localhost HTTP endpoint**: tiny TCP server on `127.0.0.1:47878` serving
+  `/battery.json` with CORS, and `/` serving an embedded standalone widget
+  HTML. Use this if you want to embed the readout in a Wallpaper Engine Web
+  wallpaper, a Rainmeter skin, or anything else that fetches JSON.
+
+Refresh interval is 10 s.
 
 ## Build
 
