@@ -673,7 +673,7 @@ static class BleBattery {
 
     // Discovers the K70's BLE MAC from the Bluetooth Pnp instance ID at runtime
     // (BTHLE\DEV_<MAC>\... where the friendly name contains "K70").
-    // Override with the BATTERYTRAY_K70_MAC env var (hex, no separators) if needed.
+    // Override with the BATTERYTRAY_K70_MAC env var (hex, no separators).
     static ulong? _cachedK70Mac;
 
     public static Result ReadK70() {
@@ -808,12 +808,265 @@ class OverlayForm : Form {
 
     public bool Draggable = false;
     public bool HideOffline = false;
+    public bool RoundedCorners = true;
     public double OverlayOpacity = 0.92;
+    public string ThemeName = "Dark";
+    public Theme CurrentTheme = Theme.Dark;
+
+    public class Theme {
+        public Color Bg;
+        public Color Border;
+        public Color Text;
+        public Color TextDim;
+        public Color EmptyCell;
+        public Color[] BarColors; // index 0..3 mapping to bar count 0 (empty=BarColors[0]) up to 4
+
+        public static readonly Theme Dark = new Theme {
+            Bg        = Color.FromArgb(220, 15, 18, 24),
+            Border    = Color.FromArgb(40, 255, 255, 255),
+            Text      = Color.FromArgb(210, 255, 255, 255),
+            TextDim   = Color.FromArgb(110, 255, 255, 255),
+            EmptyCell = Color.FromArgb(60, 255, 255, 255),
+            BarColors = new[] {
+                Color.FromArgb(240, 80, 80),    // 0 bars (low/empty fill color)
+                Color.FromArgb(240, 130, 64),   // 1
+                Color.FromArgb(240, 200, 64),   // 2
+                Color.FromArgb(96,  230, 96),   // 3
+                Color.FromArgb(96,  230, 96)    // 4 (same green as 3)
+            }
+        };
+        public static readonly Theme Light = new Theme {
+            Bg        = Color.FromArgb(230, 245, 245, 250),
+            Border    = Color.FromArgb(60, 0, 0, 0),
+            Text      = Color.FromArgb(220, 20, 24, 32),
+            TextDim   = Color.FromArgb(110, 20, 24, 32),
+            EmptyCell = Color.FromArgb(60, 0, 0, 0),
+            BarColors = new[] {
+                Color.FromArgb(220, 60, 60),
+                Color.FromArgb(220, 110, 40),
+                Color.FromArgb(210, 170, 30),
+                Color.FromArgb(60,  170, 60),
+                Color.FromArgb(60,  170, 60)
+            }
+        };
+        public static readonly Theme Oled = new Theme {
+            Bg        = Color.FromArgb(255, 0, 0, 0),
+            Border    = Color.FromArgb(80, 255, 255, 255),
+            Text      = Color.FromArgb(220, 255, 255, 255),
+            TextDim   = Color.FromArgb(110, 255, 255, 255),
+            EmptyCell = Color.FromArgb(60, 255, 255, 255),
+            BarColors = Dark.BarColors
+        };
+        public static readonly Theme Transparent = new Theme {
+            Bg        = Color.FromArgb(0, 0, 0, 0),         // fully transparent
+            Border    = Color.FromArgb(120, 255, 255, 255),
+            Text      = Color.FromArgb(230, 255, 255, 255),
+            TextDim   = Color.FromArgb(130, 255, 255, 255),
+            EmptyCell = Color.FromArgb(80, 255, 255, 255),
+            BarColors = Dark.BarColors
+        };
+        public static readonly Theme Mono = new Theme {
+            Bg        = Color.FromArgb(220, 15, 18, 24),
+            Border    = Color.FromArgb(40, 255, 255, 255),
+            Text      = Color.FromArgb(210, 255, 255, 255),
+            TextDim   = Color.FromArgb(110, 255, 255, 255),
+            EmptyCell = Color.FromArgb(60, 255, 255, 255),
+            BarColors = new[] {
+                Color.FromArgb(220, 200, 200, 200),
+                Color.FromArgb(220, 200, 200, 200),
+                Color.FromArgb(220, 200, 200, 200),
+                Color.FromArgb(220, 200, 200, 200),
+                Color.FromArgb(220, 200, 200, 200)
+            }
+        };
+    }
+
+    public static Theme GetThemeByName(string name) {
+        switch ((name ?? "").ToLowerInvariant()) {
+            case "light":       return Theme.Light;
+            case "oled":        return Theme.Oled;
+            case "mono":        return Theme.Mono;
+            case "transparent": return Theme.Transparent;
+            default:            return Theme.Dark;
+        }
+    }
+    public Color EffectiveTextColor {
+        get {
+            if (string.IsNullOrEmpty(TextColorOverride)) return CurrentTheme.Text;
+            switch (TextColorOverride.ToLowerInvariant()) {
+                case "white": return Color.FromArgb(230, 255, 255, 255);
+                case "black": return Color.FromArgb(230, 0, 0, 0);
+                case "lightgray": return Color.FromArgb(220, 200, 200, 200);
+                case "darkgray":  return Color.FromArgb(230, 60, 60, 60);
+                default: return CurrentTheme.Text;
+            }
+        }
+    }
+    public Color EffectiveTextDim {
+        get {
+            var c = EffectiveTextColor;
+            return Color.FromArgb(c.A / 2, c.R, c.G, c.B);
+        }
+    }
+    public void SetTextColor(string name) {
+        TextColorOverride = name;
+        Render();
+        SaveConfig();
+    }
+    public void SetTheme(string name) {
+        ThemeName = name;
+        CurrentTheme = GetThemeByName(name);
+        Render();
+        SaveConfig();
+    }
+    public void SetRoundedCorners(bool on) {
+        RoundedCorners = on;
+        Render();   // bg path uses RoundedCorners directly; no SetWindowRgn needed
+        SaveConfig();
+    }
 
     const int ROW_H = 30;
     const int PAD_TOP = 10;
     const int PAD_BOT = 8;
     const int FIXED_W = 270;
+
+    [DllImport("user32.dll")] static extern int SetWindowRgn(IntPtr hWnd, IntPtr hRgn, bool bRedraw);
+    [DllImport("gdi32.dll")]  static extern IntPtr CreateRoundRectRgn(int x1, int y1, int x2, int y2, int wEllipse, int hEllipse);
+
+    // Layered window API for per-pixel alpha (true transparent bg).
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    struct BLENDFUNCTION { public byte BlendOp, BlendFlags, SourceConstantAlpha, AlphaFormat; }
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst, ref Point pptDst,
+        ref Size psize, IntPtr hdcSrc, ref Point pprSrc, int crKey, ref BLENDFUNCTION pblend, int dwFlags);
+    [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr hWnd);
+    [DllImport("user32.dll")] static extern int    ReleaseDC(IntPtr hWnd, IntPtr hDC);
+    [DllImport("gdi32.dll")]  static extern IntPtr CreateCompatibleDC(IntPtr hDC);
+    [DllImport("gdi32.dll")]  static extern IntPtr SelectObject(IntPtr hDC, IntPtr hObject);
+    [DllImport("gdi32.dll")]  static extern bool   DeleteObject(IntPtr hObject);
+    [DllImport("gdi32.dll")]  static extern bool   DeleteDC(IntPtr hDC);
+    const int ULW_ALPHA = 2;
+    const byte AC_SRC_OVER = 0;
+    const byte AC_SRC_ALPHA = 1;
+
+    protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); Render(); }
+    protected override void OnResize(EventArgs e) { base.OnResize(e); Render(); }
+    protected override void OnPaintBackground(PaintEventArgs e) { /* layered window — skip */ }
+    protected override void OnPaint(PaintEventArgs e) { /* layered window — skip */ }
+
+    bool _rendering;
+    public void Render() {
+        if (!IsHandleCreated || Width <= 0 || Height <= 0) return;
+        if (_rendering) return;
+        _rendering = true;
+        try {
+            using (var bmp = new Bitmap(Width, Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb)) {
+                using (var g = Graphics.FromImage(bmp)) {
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
+                    g.Clear(Color.FromArgb(0, 0, 0, 0));
+                    DrawWidget(g);
+                }
+                PremultiplyAlpha(bmp);
+                UpdateLayered(bmp);
+            }
+        } catch { /* layered-render failures are non-fatal */ }
+        finally { _rendering = false; }
+    }
+
+    static void PremultiplyAlpha(Bitmap bmp) {
+        var rect = new Rectangle(0, 0, bmp.Width, bmp.Height);
+        var data = bmp.LockBits(rect, System.Drawing.Imaging.ImageLockMode.ReadWrite,
+                                System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        try {
+            int len = data.Stride * bmp.Height;
+            byte[] buf = new byte[len];
+            Marshal.Copy(data.Scan0, buf, 0, len);
+            for (int i = 0; i < len; i += 4) {
+                byte a = buf[i + 3];
+                if (a == 0xFF) continue;
+                if (a == 0) { buf[i] = buf[i + 1] = buf[i + 2] = 0; continue; }
+                buf[i + 0] = (byte)(buf[i + 0] * a / 255);
+                buf[i + 1] = (byte)(buf[i + 1] * a / 255);
+                buf[i + 2] = (byte)(buf[i + 2] * a / 255);
+            }
+            Marshal.Copy(buf, 0, data.Scan0, len);
+        } finally { bmp.UnlockBits(data); }
+    }
+
+    void UpdateLayered(Bitmap bmp) {
+        IntPtr screenDC = GetDC(IntPtr.Zero);
+        IntPtr memDC = CreateCompatibleDC(screenDC);
+        IntPtr hBitmap = bmp.GetHbitmap(Color.FromArgb(0));
+        IntPtr oldBitmap = SelectObject(memDC, hBitmap);
+        try {
+            var size = new Size(bmp.Width, bmp.Height);
+            var ptSrc = new Point(0, 0);
+            var topPos = new Point(Left, Top);
+            byte alpha = (byte)Math.Max(0, Math.Min(255, (int)Math.Round(OverlayOpacity * 255)));
+            var blend = new BLENDFUNCTION {
+                BlendOp = AC_SRC_OVER,
+                BlendFlags = 0,
+                SourceConstantAlpha = alpha,
+                AlphaFormat = AC_SRC_ALPHA
+            };
+            UpdateLayeredWindow(Handle, screenDC, ref topPos, ref size, memDC, ref ptSrc, 0, ref blend, ULW_ALPHA);
+        } finally {
+            SelectObject(memDC, oldBitmap);
+            DeleteObject(hBitmap);
+            DeleteDC(memDC);
+            ReleaseDC(IntPtr.Zero, screenDC);
+        }
+    }
+
+    // The actual widget drawing — bg + rows.
+    void DrawWidget(Graphics g) {
+        // Background: skip entirely if alpha 0 (Transparent theme stays clean).
+        if (CurrentTheme.Bg.A > 0) {
+            Color borderCol = Draggable ? Color.FromArgb(220, 255, 200, 90) : CurrentTheme.Border;
+            float borderWid = Draggable ? 2f : 1f;
+            if (RoundedCorners) {
+                using (var path = RoundedRect(0, 0, Width, Height, 10))
+                using (var bg = new SolidBrush(CurrentTheme.Bg))
+                using (var border = new Pen(borderCol, borderWid)) {
+                    g.FillPath(bg, path);
+                    g.DrawPath(border, path);
+                }
+            } else {
+                using (var bg = new SolidBrush(CurrentTheme.Bg))
+                using (var border = new Pen(borderCol, borderWid)) {
+                    g.FillRectangle(bg, 0, 0, Width, Height);
+                    g.DrawRectangle(border, 0, 0, Width - 1, Height - 1);
+                }
+            }
+        } else if (Draggable) {
+            // Transparent theme + drag mode: hint outline so user sees where to grab.
+            using (var path = RoundedRect(0, 0, Width, Height, 10))
+            using (var border = new Pen(Color.FromArgb(180, 255, 200, 90), 2f)) {
+                g.DrawPath(border, path);
+            }
+        }
+
+        // Rows.
+        var rows = new System.Collections.Generic.List<Action<int>>();
+        if (!HideOffline || LogiBars >= 0)
+            rows.Add(y => DrawOverlayRow(g, OverlayKind.Mouse,    LogiName, LogiPct, null, LogiBars, 0, LogiCharging,  y));
+        if (!HideOffline || KbdBars >= 0)
+            rows.Add(y => DrawOverlayRow(g, OverlayKind.Keyboard, KbdName,  KbdPct,  null, KbdBars,  0, KbdCharging,   y));
+        if (!HideOffline || ApexBars >= 0)
+            rows.Add(y => DrawOverlayRow(g, OverlayKind.Gamepad,  ApexName, null, ApexGearVal, ApexBars, ApexMaxGear, false, y));
+
+        if (rows.Count == 0) {
+            using (var f = new Font(FontFamily, FontSize, FontStyle.Italic, GraphicsUnit.Pixel))
+            using (var b = new SolidBrush(EffectiveTextDim)) {
+                var s = "no devices online";
+                var sz = g.MeasureString(s, f);
+                g.DrawString(s, f, b, (Width - sz.Width) / 2, (Height - sz.Height) / 2);
+            }
+            return;
+        }
+        for (int i = 0; i < rows.Count; i++) rows[i](PAD_TOP + i * ROW_H);
+    }
 
     static readonly string CfgFile = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -824,17 +1077,43 @@ class OverlayForm : Form {
         ShowInTaskbar   = false;
         StartPosition   = FormStartPosition.Manual;
         TopMost         = true;
-        DoubleBuffered  = true;
-        BackColor       = Color.FromArgb(15, 18, 24);
         Size            = new Size(FIXED_W, PAD_TOP + 3 * ROW_H + PAD_BOT);
         var cfg = LoadConfig();
         OverlayOpacity = cfg.opacity;
         HideOffline    = cfg.hideOffline;
-        Opacity        = OverlayOpacity;
+        RoundedCorners = cfg.rounded;
+        ThemeName      = cfg.theme;
+        CurrentTheme   = GetThemeByName(cfg.theme);
+        FontFamily     = string.IsNullOrEmpty(cfg.font) ? "Segoe UI" : cfg.font;
+        FontSize       = cfg.fontSize > 0 ? cfg.fontSize : 11f;
+        TextColorOverride = cfg.textColor;
         Location       = (cfg.x >= 0 && cfg.y >= 0) ? new Point(cfg.x, cfg.y) : DefaultPosition();
+        // NOTE: we use UpdateLayeredWindow with per-pixel alpha, so Form.Opacity
+        // and Form.BackColor are intentionally NOT set — they would either fight
+        // with the layered-window state (Opacity=1.0 disables WS_EX_LAYERED) or
+        // paint a solid rectangle under our bitmap.
     }
+    public string TextColorOverride;  // null = use theme; otherwise "white"/"black"/etc
 
-    class OverlayConfig { public int x = -1; public int y = -1; public double opacity = 0.92; public bool hideOffline = false; }
+    class OverlayConfig {
+        public int x = -1;
+        public int y = -1;
+        public double opacity = 0.92;
+        public bool hideOffline = false;
+        public bool rounded = true;
+        public string theme = "Dark";
+        public string font = "Segoe UI";
+        public float fontSize = 11f;
+        public string textColor;  // null = use theme; "white"/"black"
+    }
+    public string FontFamily = "Segoe UI";
+    public float FontSize = 11f;
+    public void SetFont(string family, float size) {
+        FontFamily = family;
+        FontSize = size;
+        Render();
+        SaveConfig();
+    }
 
     static Point DefaultPosition() {
         var wa = Screen.PrimaryScreen.WorkingArea;
@@ -846,15 +1125,26 @@ class OverlayForm : Form {
         try {
             if (!File.Exists(CfgFile)) return r;
             string t = File.ReadAllText(CfgFile);
-            var mx = System.Text.RegularExpressions.Regex.Match(t, "\"x\"\\s*:\\s*(-?\\d+)");
-            var my = System.Text.RegularExpressions.Regex.Match(t, "\"y\"\\s*:\\s*(-?\\d+)");
-            var mo = System.Text.RegularExpressions.Regex.Match(t, "\"opacity\"\\s*:\\s*([0-9.]+)");
-            var mh = System.Text.RegularExpressions.Regex.Match(t, "\"hideOffline\"\\s*:\\s*(true|false)");
+            var mx  = System.Text.RegularExpressions.Regex.Match(t, "\"x\"\\s*:\\s*(-?\\d+)");
+            var my  = System.Text.RegularExpressions.Regex.Match(t, "\"y\"\\s*:\\s*(-?\\d+)");
+            var mo  = System.Text.RegularExpressions.Regex.Match(t, "\"opacity\"\\s*:\\s*([0-9.]+)");
+            var mh  = System.Text.RegularExpressions.Regex.Match(t, "\"hideOffline\"\\s*:\\s*(true|false)");
+            var mr  = System.Text.RegularExpressions.Regex.Match(t, "\"rounded\"\\s*:\\s*(true|false)");
+            var mt  = System.Text.RegularExpressions.Regex.Match(t, "\"theme\"\\s*:\\s*\"([^\"]+)\"");
+            var mf  = System.Text.RegularExpressions.Regex.Match(t, "\"font\"\\s*:\\s*\"([^\"]+)\"");
+            var mfs = System.Text.RegularExpressions.Regex.Match(t, "\"fontSize\"\\s*:\\s*([0-9.]+)");
+            var mtc = System.Text.RegularExpressions.Regex.Match(t, "\"textColor\"\\s*:\\s*\"([^\"]+)\"");
+            if (mtc.Success) r.textColor = mtc.Groups[1].Value;
             if (mx.Success) int.TryParse(mx.Groups[1].Value, out r.x);
             if (my.Success) int.TryParse(my.Groups[1].Value, out r.y);
             if (mo.Success) double.TryParse(mo.Groups[1].Value, System.Globalization.NumberStyles.Float,
                                             System.Globalization.CultureInfo.InvariantCulture, out r.opacity);
             if (mh.Success) r.hideOffline = mh.Groups[1].Value == "true";
+            if (mr.Success) r.rounded     = mr.Groups[1].Value == "true";
+            if (mt.Success) r.theme       = mt.Groups[1].Value;
+            if (mf.Success) r.font        = mf.Groups[1].Value;
+            if (mfs.Success) float.TryParse(mfs.Groups[1].Value, System.Globalization.NumberStyles.Float,
+                                            System.Globalization.CultureInfo.InvariantCulture, out r.fontSize);
         } catch {}
         return r;
     }
@@ -862,16 +1152,22 @@ class OverlayForm : Form {
         try {
             var dir = Path.GetDirectoryName(CfgFile);
             if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+            string tc = string.IsNullOrEmpty(TextColorOverride) ? "auto" : TextColorOverride.Replace("\"", "");
             var json = string.Format(System.Globalization.CultureInfo.InvariantCulture,
-                "{{\"x\":{0},\"y\":{1},\"opacity\":{2:0.00},\"hideOffline\":{3}}}",
-                Location.X, Location.Y, OverlayOpacity, HideOffline ? "true" : "false");
+                "{{\"x\":{0},\"y\":{1},\"opacity\":{2:0.00},\"hideOffline\":{3},\"rounded\":{4},\"theme\":\"{5}\",\"font\":\"{6}\",\"fontSize\":{7:0.0},\"textColor\":\"{8}\"}}",
+                Location.X, Location.Y, OverlayOpacity,
+                HideOffline ? "true" : "false",
+                RoundedCorners ? "true" : "false",
+                ThemeName ?? "Dark",
+                (FontFamily ?? "Segoe UI").Replace("\"", ""),
+                FontSize, tc);
             File.WriteAllText(CfgFile, json);
         } catch {}
     }
 
     public void SetOpacity(double op) {
-        OverlayOpacity = Math.Max(0.2, Math.Min(1.0, op));
-        Opacity = OverlayOpacity;
+        OverlayOpacity = Math.Max(0.1, Math.Min(1.0, op));
+        Render();  // alpha is applied via BLENDFUNCTION.SourceConstantAlpha now
         SaveConfig();
     }
     public void SetHideOffline(bool h) {
@@ -892,13 +1188,11 @@ class OverlayForm : Form {
 
     public void SetDraggable(bool on) {
         Draggable = on;
-        // Recreate window handle so the ExStyle change takes effect.
         bool wasVisible = Visible;
         if (wasVisible) Hide();
         RecreateHandle();
         if (wasVisible) Show();
-        // Repaint to show/hide drag-mode hint.
-        Invalidate();
+        Render();
     }
 
     Point _dragStart;
@@ -919,100 +1213,68 @@ class OverlayForm : Form {
     }
 
     public void UpdateData() {
-        // Compute visible row count and resize.
         int n = 0;
         if (!HideOffline || LogiBars >= 0) n++;
         if (!HideOffline || KbdBars  >= 0) n++;
         if (!HideOffline || ApexBars >= 0) n++;
-        if (n == 0) n = 1;  // keep a minimal "no devices" pill rather than vanishing
+        if (n == 0) n = 1;
         int newH = PAD_TOP + n * ROW_H + PAD_BOT;
-        if (Height != newH) Height = newH;
-        Invalidate();
-    }
-
-    protected override void OnPaint(PaintEventArgs e) {
-        var g = e.Graphics;
-        g.SmoothingMode = SmoothingMode.AntiAlias;
-        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
-
-        // Rounded background
-        using (var path = RoundedRect(0, 0, Width, Height, 10))
-        using (var bg = new SolidBrush(Color.FromArgb(220, 15, 18, 24)))
-        using (var border = new Pen(Draggable ? Color.FromArgb(180, 255, 200, 90) : Color.FromArgb(40, 255, 255, 255),
-                                    Draggable ? 2f : 1f)) {
-            g.FillPath(bg, path);
-            g.DrawPath(border, path);
-        }
-
-        // Build the list of rows to render based on hide-offline setting.
-        var rows = new System.Collections.Generic.List<Action<int>>();
-        if (!HideOffline || LogiBars >= 0)
-            rows.Add(y => DrawOverlayRow(g, OverlayKind.Mouse,    LogiName, LogiPct, null, LogiBars, 0, LogiCharging,  y));
-        if (!HideOffline || KbdBars >= 0)
-            rows.Add(y => DrawOverlayRow(g, OverlayKind.Keyboard, KbdName,  KbdPct,  null, KbdBars,  0, KbdCharging,   y));
-        if (!HideOffline || ApexBars >= 0)
-            rows.Add(y => DrawOverlayRow(g, OverlayKind.Gamepad,  ApexName, null, ApexGearVal, ApexBars, ApexMaxGear, false, y));
-
-        if (rows.Count == 0) {
-            using (var f = new Font("Segoe UI", 11f, FontStyle.Italic, GraphicsUnit.Pixel))
-            using (var b = new SolidBrush(Color.FromArgb(140, 255, 255, 255))) {
-                var s = "no devices online";
-                var sz = g.MeasureString(s, f);
-                g.DrawString(s, f, b, (Width - sz.Width) / 2, (Height - sz.Height) / 2);
-            }
-            return;
-        }
-        for (int i = 0; i < rows.Count; i++) rows[i](PAD_TOP + i * ROW_H);
+        if (Height != newH) Height = newH;  // triggers OnResize → Render
+        else Render();
     }
 
     enum OverlayKind { Mouse, Keyboard, Gamepad }
 
-    static void DrawOverlayRow(Graphics g, OverlayKind kind, string name, int? pct, int? gearVal,
-                                int bars, int maxGear, bool charging, int y) {
-        // Glyph: Segoe Fluent Icons
+    void DrawOverlayRow(Graphics g, OverlayKind kind, string name, int? pct, int? gearVal,
+                         int bars, int maxGear, bool charging, int y) {
+        float fsize = FontSize;
         string glyph = kind == OverlayKind.Mouse ? "" :
                         kind == OverlayKind.Keyboard ? "" : "";
-        using (var iconFont = new Font("Segoe Fluent Icons", 12f, FontStyle.Regular, GraphicsUnit.Pixel))
-        using (var nameFont = new Font("Segoe UI", 11f, FontStyle.Regular, GraphicsUnit.Pixel))
-        using (var pctFont  = new Font("Segoe UI", 11f, FontStyle.Bold,    GraphicsUnit.Pixel))
-        using (var fg = new SolidBrush(Color.FromArgb(210, 255, 255, 255))) {
-            g.DrawString(glyph, iconFont, fg, 12, y - 1);
-            // Name (truncated to ~22 chars to fit)
+        using (var iconFont = new Font("Segoe Fluent Icons", fsize + 1f, FontStyle.Regular, GraphicsUnit.Pixel))
+        using (var nameFont = new Font(FontFamily, fsize, FontStyle.Regular, GraphicsUnit.Pixel))
+        using (var fg = new SolidBrush(EffectiveTextColor)) {
+            // Vertically center icon + name within the ROW_H slot.
+            int iconY = y + (int)((ROW_H - iconFont.GetHeight(g)) / 2);
+            int nameY = y + (int)((ROW_H - nameFont.GetHeight(g)) / 2);
+            g.DrawString(glyph, iconFont, fg, 10, iconY);
             string disp = name;
             if (disp != null && disp.Length > 26) disp = disp.Substring(0, 25) + "…";
-            g.DrawString(disp, nameFont, fg, 34, y);
+            g.DrawString(disp, nameFont, fg, 34, nameY);
         }
 
-        // Bars on the right
         int barsX = 165;
+        // Bars row: vertically center 10-px cells inside the row.
+        int cellH = 10;
+        int barY = y + (ROW_H - cellH) / 2;
         if (bars < 0) {
-            using (var off = new SolidBrush(Color.FromArgb(110, 255, 255, 255)))
-            using (var f = new Font("Segoe UI", 10f, FontStyle.Italic, GraphicsUnit.Pixel))
-                g.DrawString("offline", f, off, barsX, y + 1);
+            using (var off = new SolidBrush(EffectiveTextDim))
+            using (var f = new Font(FontFamily, fsize - 1f, FontStyle.Italic, GraphicsUnit.Pixel)) {
+                int oy = y + (int)((ROW_H - f.GetHeight(g)) / 2);
+                g.DrawString("offline", f, off, barsX, oy);
+            }
             return;
         }
-        Color fill = bars >= 3 ? Color.FromArgb(96, 230, 96)
-                   : bars >= 2 ? Color.FromArgb(240, 200, 64)
-                   : bars >= 1 ? Color.FromArgb(240, 130, 64)
-                               : Color.FromArgb(240, 80, 80);
-        int cellW = 11, cellH = 10, gap = 2;
+        int idx = Math.Max(0, Math.Min(4, bars));
+        Color fill = CurrentTheme.BarColors[idx];
+        int cellW = 11, gap = 2;
         for (int i = 0; i < 4; i++) {
             int cx = barsX + i * (cellW + gap);
-            using (var path = RoundedRect(cx, y + 3, cellW, cellH, 2))
-            using (var b = new SolidBrush(i < bars ? fill : Color.FromArgb(60, 255, 255, 255))) {
+            using (var path = RoundedRect(cx, barY, cellW, cellH, 2))
+            using (var b = new SolidBrush(i < bars ? fill : CurrentTheme.EmptyCell)) {
                 g.FillPath(b, path);
             }
         }
-        // Value text
         string valText;
         if (pct.HasValue) valText = pct.Value + "%";
-        else if (gearVal.HasValue) valText = gearVal.Value + "/" + maxGear;
+        else if (gearVal.HasValue && maxGear > 0)
+            valText = "~" + (gearVal.Value * 100 / maxGear) + "%";
         else valText = "";
         if (charging) valText += " ⚡";
-        using (var vf = new Font("Segoe UI", 10f, FontStyle.Regular, GraphicsUnit.Pixel))
-        using (var vb = new SolidBrush(Color.FromArgb(220, 255, 255, 255))) {
+        using (var vf = new Font(FontFamily, fsize - 1f, FontStyle.Regular, GraphicsUnit.Pixel))
+        using (var vb = new SolidBrush(EffectiveTextColor)) {
             var sz = g.MeasureString(valText, vf);
-            g.DrawString(valText, vf, vb, 270 - sz.Width - 10, y);
+            int vy = y + (int)((ROW_H - vf.GetHeight(g)) / 2);
+            g.DrawString(valText, vf, vb, Width - sz.Width - 10, vy);
         }
     }
 
@@ -1167,7 +1429,7 @@ function renderRow(d){
       `<div class='cell ${i<b?cls:''}'></div>`).join('') + `</div>`;
   }
   const pct = off ? '' :
-    (d.percent!=null ? `${d.percent}%` : `${d.bars}/${d.maxBars||MAX_BARS}`);
+    (d.percent!=null ? `${d.approx?'~':''}${d.percent}%` : `${d.bars}/${d.maxBars||MAX_BARS}`);
   const bolt = d.charging ? `<span class='bolt'>⚡</span>` : '';
   return `<div class='row'>
     <div class='icon'>${ICONS[d.kind]||''}</div>
@@ -1198,9 +1460,8 @@ class TrayApp : ApplicationContext {
     // Loads the Flydigi Apex UID from (in order):
     //   1) BATTERYTRAY_APEX_UID env var
     //   2) "apex-uid.txt" next to BatteryTray.exe
-    //   3) returns empty (Apex row will show "offline" until configured)
-    // Find your UID by tailing Flydigi Space Station's logs/main.log while it
-    // connects; look for a "uid":"…" string in the GetDeviceDetailInfo request.
+    //   3) returns empty (Apex row stays offline until configured)
+    // Find your UID in Flydigi Space Station's logs/main.log when it connects.
     static string LoadApexUid() {
         var ovr = Environment.GetEnvironmentVariable("BATTERYTRAY_APEX_UID");
         if (!string.IsNullOrEmpty(ovr)) return ovr.Trim();
@@ -1269,6 +1530,81 @@ class TrayApp : ApplicationContext {
             };
             miOpacity.DropDownItems.Add(item);
         }
+
+        var miRounded = new ToolStripMenuItem("Rounded corners") { CheckOnClick = true, Checked = _overlay.RoundedCorners };
+        miRounded.CheckedChanged += (s, e) => _overlay.SetRoundedCorners(miRounded.Checked);
+
+        var miTheme = new ToolStripMenuItem("Theme");
+        foreach (var t in new[] { "Dark", "Light", "OLED", "Mono", "Transparent" }) {
+            string tn = t;
+            var item = new ToolStripMenuItem(tn) {
+                CheckOnClick = true,
+                Checked = string.Equals(_overlay.ThemeName, tn, StringComparison.OrdinalIgnoreCase)
+            };
+            item.Click += (s, e) => {
+                _overlay.SetTheme(tn);
+                foreach (ToolStripMenuItem mi in miTheme.DropDownItems) mi.Checked = (mi == item);
+            };
+            miTheme.DropDownItems.Add(item);
+        }
+
+        var miTextColor = new ToolStripMenuItem("Text color");
+        var tcChoices = new[] {
+            new { Label = "Auto (theme default)", Val = (string)null },
+            new { Label = "White",                Val = "white" },
+            new { Label = "Light gray",           Val = "lightgray" },
+            new { Label = "Black",                Val = "black" },
+            new { Label = "Dark gray",            Val = "darkgray" }
+        };
+        foreach (var tc in tcChoices) {
+            string val = tc.Val;
+            var item = new ToolStripMenuItem(tc.Label) {
+                CheckOnClick = true,
+                Checked = string.Equals(_overlay.TextColorOverride ?? "auto", val ?? "auto", StringComparison.OrdinalIgnoreCase)
+            };
+            item.Click += (s, e) => {
+                _overlay.SetTextColor(val);
+                foreach (ToolStripMenuItem mi in miTextColor.DropDownItems) mi.Checked = (mi == item);
+            };
+            miTextColor.DropDownItems.Add(item);
+        }
+
+        var miFont = new ToolStripMenuItem("Font");
+        var fontFamilies = new[] {
+            "Segoe UI", "Segoe UI Variable", "Cascadia Mono", "Consolas",
+            "JetBrains Mono", "Inter", "Arial", "Calibri"
+        };
+        var miFontFamily = new ToolStripMenuItem("Family");
+        foreach (var ff in fontFamilies) {
+            string fam = ff;
+            // Only show families actually installed.
+            bool installed; try { using (var probe = new Font(fam, 10f)) { installed = string.Equals(probe.Name, fam, StringComparison.OrdinalIgnoreCase); } } catch { installed = false; }
+            if (!installed) continue;
+            var item = new ToolStripMenuItem(fam) {
+                CheckOnClick = true,
+                Checked = string.Equals(_overlay.FontFamily, fam, StringComparison.OrdinalIgnoreCase)
+            };
+            item.Click += (s, e) => {
+                _overlay.SetFont(fam, _overlay.FontSize);
+                foreach (ToolStripMenuItem mi in miFontFamily.DropDownItems) mi.Checked = (mi == item);
+            };
+            miFontFamily.DropDownItems.Add(item);
+        }
+        var miFontSize = new ToolStripMenuItem("Size");
+        foreach (var sz in new float[] { 9f, 10f, 11f, 12f, 13f, 14f, 16f }) {
+            float fs = sz;
+            var item = new ToolStripMenuItem(((int)fs) + " px") {
+                CheckOnClick = true,
+                Checked = Math.Abs(_overlay.FontSize - fs) < 0.01f
+            };
+            item.Click += (s, e) => {
+                _overlay.SetFont(_overlay.FontFamily, fs);
+                foreach (ToolStripMenuItem mi in miFontSize.DropDownItems) mi.Checked = (mi == item);
+            };
+            miFontSize.DropDownItems.Add(item);
+        }
+        miFont.DropDownItems.Add(miFontFamily);
+        miFont.DropDownItems.Add(miFontSize);
         var miExit = new ToolStripMenuItem("Exit");
         miRefresh.Click += (s, e) => Refresh();
         miOverlay.CheckedChanged += (s, e) => {
@@ -1284,6 +1620,10 @@ class TrayApp : ApplicationContext {
         menu.Items.Add(miOverlay);
         menu.Items.Add(miMove);
         menu.Items.Add(miHide);
+        menu.Items.Add(miRounded);
+        menu.Items.Add(miTheme);
+        menu.Items.Add(miTextColor);
+        menu.Items.Add(miFont);
         menu.Items.Add(miOpacity);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(miRefresh);
@@ -1323,8 +1663,8 @@ class TrayApp : ApplicationContext {
     }
     static string FmtApex(int? gear, int maxGear, bool stale) {
         if (!gear.HasValue) return "offline";
-        int bars = GearToBars(gear.Value, maxGear);
-        return bars + "/" + BARS_MAX + (stale ? " (cached — close Space Station to refresh)" : "");
+        int approxPct = (maxGear > 0) ? gear.Value * 100 / maxGear : 0;
+        return "~" + approxPct + "%" + (stale ? " (cached — close Space Station to refresh)" : "");
     }
 
     static void DbgLog(string s) {
@@ -1477,13 +1817,15 @@ class TrayApp : ApplicationContext {
         else                      sb.Append("\"percent\":null");
         sb.Append(",\"charging\":").Append(_corsairCharging ? "true" : "false").Append("}");
 
-        // Gamepad (Apex 4): bars/maxBars instead of percent
+        // Gamepad (Apex 4): firmware only exposes a 0..N "gear" scale, so we convert
+        // to approximate percent for UI consistency. The `approx` flag tells consumers
+        // to prefix a "~".
         sb.Append(",{\"kind\":\"gamepad\",\"name\":\"Flydigi Apex 4\",");
-        if (_apexGear.HasValue) {
-            sb.Append("\"bars\":").Append(_apexGear.Value)
-              .Append(",\"maxBars\":").Append(_apexMaxGear);
+        if (_apexGear.HasValue && _apexMaxGear > 0) {
+            int approxPct = _apexGear.Value * 100 / _apexMaxGear;
+            sb.Append("\"percent\":").Append(approxPct).Append(",\"approx\":true");
         } else {
-            sb.Append("\"bars\":null");
+            sb.Append("\"percent\":null");
         }
         sb.Append(",\"stale\":").Append(_apexStale ? "true" : "false").Append("}");
 
@@ -1493,8 +1835,8 @@ class TrayApp : ApplicationContext {
 
     static string ShortApex(string prefix, int? gear, int maxGear, bool stale) {
         if (!gear.HasValue) return prefix + ":-";
-        int bars = GearToBars(gear.Value, maxGear);
-        return prefix + ":" + bars + "/" + BARS_MAX + (stale ? "(stale)" : "");
+        int approxPct = (maxGear > 0) ? gear.Value * 100 / maxGear : 0;
+        return prefix + ":~" + approxPct + "%" + (stale ? "(stale)" : "");
     }
 
     enum DeviceKind { Mouse, Keyboard, Gamepad }
